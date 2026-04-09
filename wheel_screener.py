@@ -136,6 +136,28 @@ def fetch_indicators(ticker: str) -> dict:
 
 
 @st.cache_data(ttl=120)
+def fetch_atr(ticker: str, period: int = 14) -> Optional[float]:
+    """Calculate ATR-{period} from daily OHLC bars (no dedicated API endpoint)."""
+    client = get_client()
+    try:
+        bars = list(client.list_aggs(
+            ticker=ticker, multiplier=1, timespan="day",
+            from_=(date.today() - timedelta(days=period * 3)).isoformat(),
+            to=date.today().isoformat(),
+            adjusted=True, sort="asc", limit=period + 5,
+        ))
+        if len(bars) < 2:
+            return None
+        true_ranges = []
+        for i in range(1, len(bars)):
+            h, l, pc = bars[i].high, bars[i].low, bars[i - 1].close
+            true_ranges.append(max(h - l, abs(h - pc), abs(l - pc)))
+        return sum(true_ranges[-period:]) / min(period, len(true_ranges))
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=120)
 def fetch_options_chain(ticker: str, contract_type: str,
                          dte_min: int, dte_max: int) -> pd.DataFrame:
     client = get_client()
@@ -210,6 +232,23 @@ def enrich_chain(df: pd.DataFrame, spot: float,
 
     # absolute delta for unified put/call display
     df["abs_delta"] = df["delta"].abs()
+
+    # expected move = price × IV × √(DTE/365)  — 1σ move by expiration
+    from math import sqrt
+    df["exp_move"] = df.apply(
+        lambda r: round(spot * (r["iv"] / 100) * sqrt(r["dte"] / 365), 2)
+        if r["iv"] and r["dte"] > 0 else None, axis=1
+    )
+    df["exp_move_pct"] = df.apply(
+        lambda r: round(r["exp_move"] / spot * 100, 1)
+        if r["exp_move"] else None, axis=1
+    )
+    # vs_move: how far OTM the strike is as % of the expected move
+    # >100% = strike is beyond the 1σ range (cushion); <100% = inside (more risk)
+    df["vs_move"] = df.apply(
+        lambda r: round(abs(r["distance_pct"]) / r["exp_move_pct"] * 100, 0)
+        if r["exp_move_pct"] else None, axis=1
+    )
 
     # wheel score (0-5):
     #   +2 delta in sweet spot
@@ -306,6 +345,7 @@ if "breadth_history" not in st.session_state:
 
 snap   = fetch_snapshot(ticker)
 indic  = fetch_indicators(ticker)
+atr    = fetch_atr(ticker)
 trend_label, trend_color, trend_score = trend_badge(indic, snap)
 
 price      = snap.get("price", 0)
@@ -315,7 +355,7 @@ day_chg_pct = (day_chg / prev_close * 100) if day_chg and prev_close else None
 
 # ── header row ───────────────────────────────────────────────────────────────
 
-col_title, col_price, col_chg, col_trend, col_rsi, col_macd = st.columns([2, 1.5, 1.5, 1.5, 1.2, 1.5])
+col_title, col_price, col_chg, col_trend, col_rsi, col_macd, col_atr = st.columns([2, 1.5, 1.5, 1.5, 1.2, 1.5, 1.5])
 
 with col_title:
     st.markdown(f"## {ticker}")
@@ -359,6 +399,22 @@ with col_macd:
         if mval is not None else "<div style='padding-top:4px'>MACD: --</div>",
         unsafe_allow_html=True,
     )
+
+with col_atr:
+    if atr is not None:
+        atr_pct = atr / price * 100 if price else 0
+        # colour by ATR% — high ATR = more volatile = more caution for wheel
+        atr_color = "#f38ba8" if atr_pct > 3 else ("#f9e2af" if atr_pct > 1.5 else "#a6e3a1")
+        st.markdown(
+            f"<div style='padding-top:4px'>"
+            f"<span style='font-size:0.75rem;color:#a6adc8;text-transform:uppercase'>ATR-14</span><br>"
+            f"<span style='font-size:1.2rem;font-weight:600;color:{atr_color}'>${atr:.2f}</span>"
+            f"<span style='color:#6c7086;font-size:0.8rem'> ({atr_pct:.1f}%/day)</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown("<div style='padding-top:4px'>ATR: --</div>", unsafe_allow_html=True)
 
 # ── market breadth ───────────────────────────────────────────────────────────
 
@@ -484,6 +540,9 @@ display_cols = {
     "delta":        "Delta",
     "theta":        "Theta/day",
     "iv":           "IV %",
+    "exp_move":     "Exp Move $",
+    "exp_move_pct": "Exp Move %",
+    "vs_move":      "vs Move %",
     "premium":      "Premium",
     "ann_yield_pct":"Ann Yield %",
     "oi":           "OI",
@@ -521,23 +580,34 @@ if not df_filtered.empty:
                 return "color: #a6e3a1"
             return "color: #6c7086"
 
+        def vs_move_color(val):
+            if pd.isna(val):           return "color: #6c7086"
+            if val >= 150:             return "color: #a6e3a1; font-weight: bold"
+            if val >= 100:             return "color: #a6e3a1"
+            if val >= 75:              return "color: #f9e2af"
+            return "color: #f38ba8"   # inside expected move — higher risk
+
         return (
             df.style
             .apply(row_style, axis=1)
-            .map(score_color,  subset=["Score"])
-            .map(yield_color,  subset=["Ann Yield %"])
-            .map(delta_color,  subset=["Delta"])
+            .map(score_color,    subset=["Score"])
+            .map(yield_color,    subset=["Ann Yield %"])
+            .map(delta_color,    subset=["Delta"])
+            .map(vs_move_color,  subset=["vs Move %"])
             .format({
                 "Strike":       "${:.2f}",
                 "Dist %":       "{:+.1f}%",
                 "Delta":        "{:.3f}",
                 "Theta/day":    "{:.4f}",
                 "IV %":         "{:.1f}%",
+                "Exp Move $":   "${:.2f}",
+                "Exp Move %":   "{:.1f}%",
+                "vs Move %":    "{:.0f}%",
                 "Premium":      "${:.2f}",
                 "Ann Yield %":  "{:.1f}%",
                 "OI":           "{:,.0f}",
                 "Volume":       "{:,.0f}",
-            })
+            }, na_rep="--")
         )
 
     st.dataframe(
@@ -667,11 +737,14 @@ if top.empty:
 if not top.empty:
     for _, r in top.iterrows():
         in_z = "🟢" if r["in_zone"] else "⚪"
-        col1, col2, col3, col4, col5, col6, col7 = st.columns([0.3, 1, 1, 1, 1, 1.2, 1.5])
+        col1, col2, col3, col4, col5, col6, col7, col8 = st.columns([0.3, 1, 1, 1, 1, 1.2, 1.2, 1.2])
         col1.markdown(in_z)
-        col2.metric("Strike",    f"${r['strike']:.2f}")
-        col3.metric("Expiry",    f"{r['exp_date']} ({int(r['dte'])}d)")
-        col4.metric("Premium",   f"${r['premium']:.2f}")
-        col5.metric("Ann Yield", f"{r['ann_yield_pct']:.1f}%")
+        col2.metric("Strike",     f"${r['strike']:.2f}")
+        col3.metric("Expiry",     f"{r['exp_date']} ({int(r['dte'])}d)")
+        col4.metric("Premium",    f"${r['premium']:.2f}")
+        col5.metric("Ann Yield",  f"{r['ann_yield_pct']:.1f}%")
         col6.metric("Delta / IV", f"{r['delta']:.3f} / {r['iv']:.1f}%")
-        col7.metric("Score / OI", f"{int(r['wheel_score'])}/5  ·  OI {int(r['oi']):,}")
+        vs = r.get("vs_move")
+        col7.metric("vs Exp Move", f"{vs:.0f}%" if vs and not pd.isna(vs) else "--",
+                    help=">100% = strike is beyond the 1σ expected move")
+        col8.metric("Score / OI",  f"{int(r['wheel_score'])}/5  ·  OI {int(r['oi']):,}")
