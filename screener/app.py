@@ -37,10 +37,11 @@ import plotly.express as px
 import streamlit as st
 import yfinance as yf
 
-from universe import COMBINED, SECTOR_OVERRIDES
-from fetchers import fetch_price_history, fetch_fundamentals, \
-                     fetch_realtime_snapshots, fetch_short_interest_bulk
-from signals  import build_screener_df, calc_technicals
+from universe     import COMBINED, SECTOR_OVERRIDES
+from fetchers     import fetch_price_history, fetch_fundamentals, \
+                         fetch_realtime_snapshots, fetch_short_interest_bulk
+from signals      import build_screener_df, calc_technicals
+from options_flow import fetch_flow_bulk, fmt_pc, fmt_flow_score, render_unusual_table
 
 
 # ── page config ───────────────────────────────────────────────────────────────
@@ -91,8 +92,9 @@ def render_tags(tag_str: str) -> str:
         html += f"<span style='background:{bg};color:{fg};padding:1px 6px;border-radius:8px;font-size:.68rem;font-weight:600;margin:1px;display:inline-block'>{tag}</span>"
     return html
 
-def score_bar(score: int, max_score: int = 11) -> str:
+def score_bar(score: int, max_score: int = 14) -> str:
     pct   = (score + max_score) / (2 * max_score) * 100
+    pct   = max(0, min(100, pct))
     color = "#a6e3a1" if score >= 3 else ("#f9e2af" if score >= 0 else "#f38ba8")
     return (
         f"<div style='background:#313244;border-radius:4px;height:16px;width:100%'>"
@@ -154,16 +156,23 @@ with st.sidebar:
                                index=0)
 
     st.divider()
+    st.subheader("Options Flow")
+    flow_enabled = st.toggle("Enable options flow analysis", value=False,
+                             help="Fetches live options chains via Massive API. ~20-40s for full universe.")
+    if flow_enabled:
+        st.caption("P/C ratio · Unusual sweeps · Max pain  ·  Cached 15 min")
+
+    st.divider()
     if st.button("🔄  Refresh all data", use_container_width=True):
         st.cache_data.clear()
         st.rerun()
-    st.caption("Prices: 5 min  ·  Indicators: 1 hr  ·  Fundamentals: 6 hr")
+    st.caption("Prices: 5 min  ·  Indicators: 1 hr  ·  Fundamentals: 6 hr  ·  Flow: 15 min")
 
 
 # ── load data ─────────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def _load_all():
+def _load_base():
     prices  = fetch_price_history("6mo")
     funds   = fetch_fundamentals()
     rt      = fetch_realtime_snapshots()
@@ -171,11 +180,33 @@ def _load_all():
     return build_screener_df(prices, funds, rt, si)
 
 with st.spinner("Loading screener data… first run takes ~30s, then cached."):
-    df = _load_all()
+    df = _load_base()
 
 if df.empty:
     st.error("No data loaded. Check your connection and try refreshing.")
     st.stop()
+
+# ── options flow overlay (optional) ──────────────────────────────────────────
+
+flow_df = pd.DataFrame()
+if flow_enabled:
+    with st.spinner("Loading options flow data… fetching chains for full universe (~30s)…"):
+        flow_df = fetch_flow_bulk(tuple(COMBINED))
+    if not flow_df.empty:
+        # merge flow_score + metrics into main df
+        for col in ["pc_vol", "pc_oi", "max_pain", "flow_score", "call_vol", "put_vol"]:
+            if col in flow_df.columns:
+                df = df.copy()
+                idx = df.set_index("ticker").index if "ticker" in df.columns else df.index
+                df = df.set_index("ticker") if "ticker" in df.columns else df
+                df[col] = flow_df[col]
+                df = df.reset_index()
+        # recompute composite with flow_score
+        if "flow_score" in df.columns:
+            df["flow_score"] = df["flow_score"].fillna(0).astype(int)
+            df["composite"]  = df["tech_score"] + df["fund_score"] + df["flow_score"]
+            df = df.sort_values("composite", ascending=False)
+            df["rank"] = range(1, len(df) + 1)
 
 # ── apply sidebar filters ─────────────────────────────────────────────────────
 
@@ -234,12 +265,13 @@ with tab_screen:
 
     # ── column sort selector ─────────────────────────────────────────────────
     sort_col, sort_dir_col, _ = st.columns([2, 1, 5])
+    flow_sort_opts = ["flow_score", "pc_vol"] if flow_enabled else []
     sort_by  = sort_col.selectbox("Sort by", [
         "composite", "tech_score", "fund_score",
         "ret_1d", "ret_1w", "ret_1m", "ret_3m",
         "rsi14", "vol_ratio", "shortPercentOfFloat",
         "forwardPE", "earningsGrowth", "revenueGrowth",
-    ], index=0, label_visibility="collapsed")
+    ] + flow_sort_opts, index=0, label_visibility="collapsed")
     asc = sort_dir_col.radio("", ["↓ Desc", "↑ Asc"], horizontal=True,
                              label_visibility="collapsed") == "↑ Asc"
     fdf_sorted = fdf.sort_values(sort_by, ascending=asc, na_position="last")
@@ -256,7 +288,7 @@ with tab_screen:
         cap_str = ("—" if not mktcap or np.isnan(mktcap) else
                    f"${mktcap/1e12:.1f}T" if mktcap >= 1e12 else f"${mktcap/1e9:.0f}B")
 
-        display_rows.append({
+        row_dict = {
             "Ticker":    r["ticker"],
             "Company":   (r.get("shortName") or "")[:22],
             "Sector":    (r.get("sector") or "—")[:18],
@@ -277,7 +309,13 @@ with tab_screen:
             "Short %":   "—" if pd.isna(r.get("shortPercentOfFloat", float("nan"))) else f"{r['shortPercentOfFloat']*100:.1f}%",
             "Tags":      render_tags(r.get("tags", "")),
             "Score":     score_bar(int(r.get("composite", 0))),
-        })
+        }
+        if flow_enabled and not flow_df.empty:
+            row_dict["Flow"] = fmt_flow_score(r.get("flow_score"))
+            row_dict["P/C"]  = fmt_pc(r.get("pc_vol"))
+            mp = r.get("max_pain")
+            row_dict["Max Pain"] = f"${mp:.0f}" if mp and not np.isnan(float(mp)) else "—"
+        display_rows.append(row_dict)
 
     display_df = pd.DataFrame(display_rows)
 
@@ -531,6 +569,60 @@ with tab_dive:
                         f"<span style='color:#a6adc8;font-size:.8rem'>{k}</span>"
                         f"<span style='color:#cdd6f4;font-size:.8rem;font-weight:600'>{v}</span>"
                         f"</div>", unsafe_allow_html=True)
+
+    # ── options flow section ─────────────────────────────────────────────────
+    if flow_enabled:
+        st.divider()
+        st.subheader(f"Options Flow — {sel}")
+
+        # fetch single-ticker flow if not already in bulk (or re-fetch)
+        ticker_flow = {}
+        if not flow_df.empty and sel in flow_df.index:
+            ticker_flow = flow_df.loc[sel].to_dict()
+
+        if ticker_flow:
+            fo1, fo2, fo3, fo4 = st.columns(4)
+            pc_v  = ticker_flow.get("pc_vol", float("nan"))
+            pc_o  = ticker_flow.get("pc_oi",  float("nan"))
+            mp    = ticker_flow.get("max_pain")
+            fs    = ticker_flow.get("flow_score", 0)
+            cv    = ticker_flow.get("call_vol", 0)
+            pv    = ticker_flow.get("put_vol",  0)
+
+            fo1.metric("P/C Vol Ratio", f"{pc_v:.2f}" if pd.notna(pc_v) else "—",
+                       help="< 0.75 = call-heavy (bullish)  ·  > 1.25 = put-heavy (bearish)")
+            fo2.metric("P/C OI Ratio",  f"{pc_o:.2f}" if pd.notna(pc_o) else "—",
+                       help="Open interest ratio — positioning over time")
+            fo3.metric("Max Pain",      f"${mp:.0f}"  if mp else "—",
+                       help="Strike where maximum options expire worthless (nearest expiry)")
+            fo4.metric("Flow Score",    f"{fs:+d}",
+                       help="Composite flow score: P/C ratio + unusual sweep direction (-3 to +3)")
+
+            # call vs put volume bar
+            if cv + pv > 0:
+                call_pct = cv / (cv + pv) * 100
+                put_pct  = pv / (cv + pv) * 100
+                st.markdown(
+                    f"<div style='margin:8px 0 4px 0;font-size:.75rem;color:#a6adc8'>Call vs Put Volume</div>"
+                    f"<div style='display:flex;border-radius:6px;overflow:hidden;height:20px'>"
+                    f"<div style='background:#1e3a2f;width:{call_pct:.0f}%;display:flex;align-items:center;"
+                    f"justify-content:center;color:#a6e3a1;font-size:.7rem;font-weight:600'>"
+                    f"{'Calls ' + str(int(cv/1000))+'K' if cv >= 1000 else 'Calls'}</div>"
+                    f"<div style='background:#3a1e1e;width:{put_pct:.0f}%;display:flex;align-items:center;"
+                    f"justify-content:center;color:#f38ba8;font-size:.7rem;font-weight:600'>"
+                    f"{'Puts ' + str(int(pv/1000))+'K' if pv >= 1000 else 'Puts'}</div>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+            # unusual activity table
+            st.markdown("**Unusual Volume (vol/OI ≥ 1.5×)**")
+            unusual = st.session_state.get("_unusual_map", {}).get(sel, [])
+            st.markdown(render_unusual_table(unusual), unsafe_allow_html=True)
+
+        else:
+            st.info(f"Options flow data not available for {sel}. "
+                    "Enable the flow toggle and ensure Massive API key is set.")
 
     # recent news
     st.divider()

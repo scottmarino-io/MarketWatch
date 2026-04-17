@@ -206,6 +206,7 @@ def build_screener_df(
     fundamentals:  pd.DataFrame,
     rt_snapshots:  pd.DataFrame,
     short_interest: pd.DataFrame,
+    flow_data:      Optional[pd.DataFrame] = None,
 ) -> pd.DataFrame:
     """
     Merge all data sources and compute composite scores.
@@ -232,10 +233,19 @@ def build_screener_df(
             if col not in df.columns:
                 df[col] = short_interest[col]
 
+    # 4b. merge options flow data if provided
+    if flow_data is not None and not flow_data.empty:
+        flow_cols = ["pc_vol", "pc_oi", "max_pain", "flow_score", "call_vol", "put_vol"]
+        for col in flow_cols:
+            if col in flow_data.columns:
+                df[col] = flow_data[col]
+
     # 5. scores
     df["tech_score"] = df.apply(score_technical,   axis=1)
     df["fund_score"] = df.apply(score_fundamental, axis=1)
-    df["composite"]  = df["tech_score"] + df["fund_score"]
+    # flow_score already in df if flow data was merged, else default 0 for composite
+    df["flow_score"] = df.get("flow_score", pd.Series(0, index=df.index)).fillna(0).astype(int)
+    df["composite"]  = df["tech_score"] + df["fund_score"] + df["flow_score"]
 
     # 6. strategy tags
     df["tags"] = df.apply(lambda r: " ".join(tag_strategies(r)), axis=1)
